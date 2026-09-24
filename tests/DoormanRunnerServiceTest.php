@@ -46,6 +46,9 @@ class DoormanRunnerServiceTest extends SapphireTest
         $runner = Injector::inst()->create(QueuedJobService::class)->queueRunner;
 
         $this->assertInstanceOf(DoormanRunner::class, $runner);
-        $this->assertNotEmpty($runner->getDefaultRules(), 'queueRunner resolved through DoormanRunner has no DefaultRules');
+        $this->assertNotEmpty(
+            $runner->getDefaultRules(),
+            'queueRunner resolved through DoormanRunner has no DefaultRules'
+        );
     }
 }
