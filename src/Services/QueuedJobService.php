@@ -153,6 +153,16 @@ class QueuedJobService
     private static $worker_ttl = 'PT5M';
 
     /**
+     * Move the job lock expiry forward (now + worker_ttl) after every processed step, so that
+     * checkJobHealth() only treats a job as stalled when it made no progress for worker_ttl,
+     * rather than whenever it has been running longer than worker_ttl.
+     *
+     * @var bool
+     * @config
+     */
+    private static $refresh_worker_lock = true;
+
+    /**
      * Duration for TTL of initialising state based on ISO 8601 duration specification.
      * if a job is stuck in this state longer than this value it's considered stalled
      *
@@ -167,6 +177,13 @@ class QueuedJobService
      * @var int
      */
     protected $startedAt = 0;
+
+    /**
+     * Lock tokens (the "Worker" value) this process acquired in grabMutex(), by descriptor ID
+     *
+     * @var array<int, string>
+     */
+    protected $workerLocks = [];
 
     /**
      * Should "immediate" jobs be managed using the shutdown function?
@@ -808,6 +825,9 @@ class QueuedJobService
                 if ($updatedDescriptor === null || $updatedDescriptor->Worker !== $mutex) {
                     throw new Exception('Wrong status or process. Job reserved already');
                 }
+
+                // Remember the token, so this process can refresh its own lock (and only its own)
+                $this->workerLocks[$descriptorId] = $mutex;
             });
 
             return true;
@@ -1035,6 +1055,7 @@ class QueuedJobService
                     if ($jobDescriptor) {
                         $this->copyJobToDescriptor($job, $jobDescriptor);
                         $jobDescriptor->write();
+                        $this->refreshJobLock($jobDescriptor);
                     } else {
                         $logger->error(
                             'Job descriptor has been set to null',
@@ -1046,6 +1067,9 @@ class QueuedJobService
                         $broken = true;
                     }
                 }
+
+                // The job is no longer processed by this run, so its lock is not refreshed any more
+                unset($this->workerLocks[(int) $jobId]);
 
                 // a last final save. The job is complete by now
                 if ($jobDescriptor) {
@@ -1834,6 +1858,30 @@ class QueuedJobService
     protected function releaseJobLock(QueuedJobDescriptor $descriptor): void
     {
         $descriptor->Worker = null;
+        unset($this->workerLocks[(int) $descriptor->ID]);
+    }
+
+    /**
+     * Move the lock expiry of a running job forward, if this process holds its lock. The update
+     * is conditional on the token grabMutex() wrote, so a lock that another process has taken
+     * over (e.g. after a health check restart) is never extended.
+     */
+    protected function refreshJobLock(QueuedJobDescriptor $descriptor): void
+    {
+        if (!$this->config()->get('refresh_worker_lock')) {
+            return;
+        }
+
+        $descriptorId = (int) $descriptor->ID;
+        $mutex = $this->workerLocks[$descriptorId] ?? null;
+        if (!$mutex) {
+            return;
+        }
+
+        DB::prepared_query(
+            'UPDATE "QueuedJobDescriptor" SET "Expiry" = ? WHERE "ID" = ? AND "Worker" = ? AND "JobStatus" = ?',
+            [$this->getWorkerExpiry(), $descriptorId, $mutex, QueuedJob::STATUS_RUN]
+        );
     }
 
     /**
