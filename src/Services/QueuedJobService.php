@@ -156,11 +156,8 @@ class QueuedJobService
      * Move the job lock expiry forward (now + worker_ttl) after every processed step, so that
      * checkJobHealth() only treats a job as stalled when it made no progress for worker_ttl,
      * rather than whenever it has been running longer than worker_ttl.
-     *
-     * @var bool
-     * @config
      */
-    private static $refresh_worker_lock = true;
+    private static bool $refresh_worker_lock = true;
 
     /**
      * Duration for TTL of initialising state based on ISO 8601 duration specification.
@@ -180,10 +177,8 @@ class QueuedJobService
 
     /**
      * Lock tokens (the "Worker" value) this process acquired in grabMutex(), by descriptor ID
-     *
-     * @var array<int, string>
      */
-    protected $workerLocks = [];
+    protected array $workerLocks = [];
 
     /**
      * Should "immediate" jobs be managed using the shutdown function?
@@ -827,7 +822,7 @@ class QueuedJobService
                 }
 
                 // Remember the token, so this process can refresh its own lock (and only its own)
-                $this->workerLocks[$descriptorId] = $mutex;
+                $this->workerLocks[$updatedDescriptor->ID] = $mutex;
             });
 
             return true;
@@ -1069,7 +1064,7 @@ class QueuedJobService
                 }
 
                 // The job is no longer processed by this run, so its lock is not refreshed any more
-                unset($this->workerLocks[(int) $jobId]);
+                unset($this->workerLocks[$jobId]);
 
                 // a last final save. The job is complete by now
                 if ($jobDescriptor) {
@@ -1858,7 +1853,7 @@ class QueuedJobService
     protected function releaseJobLock(QueuedJobDescriptor $descriptor): void
     {
         $descriptor->Worker = null;
-        unset($this->workerLocks[(int) $descriptor->ID]);
+        unset($this->workerLocks[$descriptor->ID]);
     }
 
     /**
@@ -1868,20 +1863,27 @@ class QueuedJobService
      */
     protected function refreshJobLock(QueuedJobDescriptor $descriptor): void
     {
-        if (!$this->config()->get('refresh_worker_lock')) {
+        if (!static::config()->get('refresh_worker_lock')) {
             return;
         }
 
-        $descriptorId = (int) $descriptor->ID;
-        $mutex = $this->workerLocks[$descriptorId] ?? null;
+        $mutex = $this->workerLocks[$descriptor->ID] ?? null;
         if (!$mutex) {
             return;
         }
 
-        DB::prepared_query(
-            'UPDATE "QueuedJobDescriptor" SET "Expiry" = ? WHERE "ID" = ? AND "Worker" = ? AND "JobStatus" = ?',
-            [$this->getWorkerExpiry(), $descriptorId, $mutex, QueuedJob::STATUS_RUN]
-        );
+        // Not $descriptor->write(): that saves by ID alone, so it would also extend a lock another
+        // process has taken over. The token in the WHERE makes this a compare-and-set, which only
+        // updates the row while this process still holds the lock.
+        SQLUpdate::create(
+            '"QueuedJobDescriptor"',
+            ['"Expiry"' => $this->getWorkerExpiry()],
+            [
+                '"ID"' => $descriptor->ID,
+                '"Worker"' => $mutex,
+                '"JobStatus"' => QueuedJob::STATUS_RUN,
+            ]
+        )->execute();
     }
 
     /**
